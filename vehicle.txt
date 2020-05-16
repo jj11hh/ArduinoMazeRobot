@@ -1,0 +1,1565 @@
+/******************* vehicle.ino **********************/
+#include <U8g2lib.h>
+#include <U8x8lib.h>
+
+#include "Motor9110.h"
+#include "SensorMatch.h"
+#include "FastGPIO.h"
+#include "MazeSolver.h"
+
+U8X8_SSD1306_128X64_NONAME_HW_I2C
+u8x8(U8G2_R0);
+
+class Logger{
+    private:
+    typeof(u8x8)& m_oled;
+    public:
+    Logger(typeof(u8x8) &oled): m_oled(oled){};
+    Logger* log(int info){
+      m_oled.print(info);
+      return this;  
+    }
+    Logger* log(const char * info){
+      m_oled.print(info);
+      return this;  
+    }
+};
+
+Motor9110<9, 6, 3, 5> motor;
+SensorDigital<Pins_5<A0, 7, 12, 11, 10>> sensor;
+Logger logger(u8x8);
+//SensorMatch<typeof(sensor), 5, 500> * matcher;
+MazeSolver<typeof(motor), typeof(sensor), Logger, 32> solver(motor, sensor, logger);
+
+void setup() {
+  sensor.begin();
+  motor.begin();
+  u8x8.begin();
+  u8x8.setPowerSave(0);
+  u8x8.setFont(u8x8_font_5x8_r);
+
+  FastGPIO::Pin<2>::setInputPulledUp();
+
+  //matcher = new SensorMatch<typeof(sensor), 5, 500>(sensor);
+
+  if (solver.solve()){
+    logger.log("PRS TO REP\n");
+    while(digitalRead(2) == HIGH);
+    logger.log("REPLAYING\n");
+    solver.replay();
+  }
+}
+
+void loop() {
+}
+
+
+/******************* MazeSolver.h **********************/
+#pragma once
+#include "SensorMatch.h"
+#include <Arduino.h>
+#include <stdint.h>
+
+#define JUNC_DEFS \
+  JUNC_DEF(ROADEND, 0b0010)\
+  JUNC_DEF(EXIT,    0b0000)\
+  JUNC_DEF(LCORN,   0b1010)\
+  JUNC_DEF(LJUNC,   0b1110)\
+  JUNC_DEF(RCORN,   0b0011)\
+  JUNC_DEF(RJUNC,   0b0111)\
+  JUNC_DEF(TJUNC,   0b1011)\
+  JUNC_DEF(CROSS,   0b1111)\
+  JUNC_DEF(NORM,    0b0110)
+
+#define DASH_TIME      350
+#define BLANK_TIME     200
+#define CRUISE_SPEED  200
+#define DEBONUS_TIME  20
+#define TURN_SPEED    200
+#define TURN_TIME     650
+
+#define _LEFT  3
+#define _FORE  2
+#define _BACK  1
+#define _RIGHT 0
+#define _juncHas(junc, end) ((junc) & (1 << (end)))
+
+typedef uint8_t junction_t;
+
+#define JUNC_DEF(name, mask) constexpr junction_t name = mask;
+    JUNC_DEFS
+#undef JUNC_DEF
+
+template <typename TMotor, typename TSensor, typename TLogger, uint8_t STACK_SIZE = 64>
+class MazeSolver{
+  private:
+    TMotor    &m_motor;
+    TSensor   &m_sensor;
+    TLogger   &m_logger;
+    uint32_t  m_blankTime = 0;
+
+    junction_t m_stackJunc[STACK_SIZE];
+    uint8_t   m_stackChoose[STACK_SIZE];
+    uint8_t   m_sp = 0;
+    SensorMatch<TSensor, 5> * m_matcher;
+    uint32_t  m_debonus = 0;
+
+    void redirect(uint8_t curDirect, uint8_t distDirect);
+    void redirectWithLine(uint8_t curDirect, uint8_t distDirect);
+    void                stackPush(junction_t, uint8_t);
+    void                stackPop(junction_t *, uint8_t *);
+    void                stackPeek(junction_t *, uint8_t *);
+    void                dash(uint16_t time);
+    void                turnLeft();
+    void                turnRight();
+    void                turnAround();
+    void                turnLeftWithLine();
+    void                turnRightWithLine();
+    void                turnAroundWithLine();
+    public :inline void fix() __attribute__((always_inline)){
+      m_matcher->update();
+      if(MATCH(m_matcher, ABAAA)){
+        SETMOTOR(m_motor, -CRUISE_SPEED, CRUISE_SPEED);
+      }
+      else if(MATCH(m_matcher, AAABA)){
+        SETMOTOR(m_motor, CRUISE_SPEED, -CRUISE_SPEED);
+      }
+      else{
+        SETMOTOR(m_motor, CRUISE_SPEED, CRUISE_SPEED);
+      }
+    }
+  public:
+    MazeSolver(TMotor &motor, TSensor &sensor, TLogger &logger): m_motor(motor), m_sensor(sensor), m_logger(logger){
+      m_matcher = new SensorMatch<TSensor, 5>(m_sensor);  
+    }
+    SensorMatch<TSensor, 5>* getMatcher();
+    bool                solve();
+    junction_t          cruise();
+    void                replay();
+    static const char*  juncToName(junction_t);
+};
+
+
+
+template <typename TMotor, typename TSensor, typename TLogger, uint8_t STACK_SIZE>
+const static char* MazeSolver<TMotor, TSensor,  TLogger, STACK_SIZE>::juncToName(junction_t junc) {
+  switch (junc){
+#define JUNC_DEF(name, mask) case mask: return #name; break;
+    JUNC_DEFS
+#undef JUNC_DEF
+    default:
+      return "UNDEFINED";
+  }
+}
+
+template <typename TMotor, typename TSensor, typename TLogger, uint8_t STACK_SIZE>
+void MazeSolver<TMotor, TSensor,  TLogger, STACK_SIZE>::stackPush(junction_t junc, uint8_t choose){
+  m_stackJunc[m_sp] = junc;
+  m_stackChoose[m_sp] = choose;
+  m_sp ++;
+}
+
+template <typename TMotor, typename TSensor, typename TLogger, uint8_t STACK_SIZE>
+void MazeSolver<TMotor, TSensor,  TLogger, STACK_SIZE>::stackPop(junction_t* junc, uint8_t* choose){
+  m_sp --;
+  *junc  = m_stackJunc[m_sp];
+  *choose = m_stackChoose[m_sp];
+}
+
+template <typename TMotor, typename TSensor, typename TLogger, uint8_t STACK_SIZE>
+void MazeSolver<TMotor, TSensor,  TLogger, STACK_SIZE>::stackPeek(junction_t* junc, uint8_t* choose){
+  *junc  = m_stackJunc[m_sp - 1];
+  *choose = m_stackChoose[m_sp - 1];
+}
+
+template <typename TMotor, typename TSensor, typename TLogger, uint8_t STACK_SIZE>
+void MazeSolver<TMotor, TSensor,  TLogger, STACK_SIZE>::redirect(uint8_t curDirect, uint8_t distDirect){
+  if (curDirect == distDirect){
+    return;  // do nothing  
+  }    
+
+#define m(cur, dist) (curDirect == (cur) && distDirect == (dist))
+  if (m(_FORE, _BACK) || m(_BACK, _FORE) || m(_LEFT, _RIGHT) || m(_RIGHT, _LEFT)){
+    turnAround();
+    return;  
+  }
+
+  if (m(_FORE, _LEFT) || m(_BACK, _RIGHT) || m(_LEFT, _BACK) || m(_RIGHT, _FORE)){
+    turnLeft();
+    return;  
+  }
+
+  if (m(_FORE, _RIGHT) || m(_BACK, _LEFT) || m(_LEFT, _FORE) || m(_RIGHT, _BACK)){
+    turnRight();                                                                            
+    return;  
+  }
+#undef m
+}
+
+template <typename TMotor, typename TSensor, typename TLogger, uint8_t STACK_SIZE>
+void MazeSolver<TMotor, TSensor,  TLogger, STACK_SIZE>::redirectWithLine(uint8_t curDirect, uint8_t distDirect){
+  if (curDirect == distDirect){
+    return;  // do nothing  
+  }    
+
+#define m(cur, dist) (curDirect == (cur) && distDirect == (dist))
+  if (m(_FORE, _BACK) || m(_BACK, _FORE) || m(_LEFT, _RIGHT) || m(_RIGHT, _LEFT)){
+    turnAroundWithLine();
+    return;  
+  }
+
+  if (m(_FORE, _LEFT) || m(_BACK, _RIGHT) || m(_LEFT, _BACK) || m(_RIGHT, _FORE)){
+    turnLeftWithLine();
+    return;  
+  }
+
+  if (m(_FORE, _RIGHT) || m(_BACK, _LEFT) || m(_LEFT, _FORE) || m(_RIGHT, _BACK)){
+    turnRightWithLine();                                                                            
+    return;  
+  }
+#undef m
+}
+
+
+template <typename TMotor, typename TSensor, typename TLogger, uint8_t STACK_SIZE>
+void MazeSolver<TMotor, TSensor,  TLogger, STACK_SIZE>::dash(uint16_t time){
+  SETMOTOR(m_motor, CRUISE_SPEED, CRUISE_SPEED);
+  delay(time);
+  SETMOTOR(m_motor, 0, 0);
+}
+
+
+template <typename TMotor, typename TSensor, typename TLogger, uint8_t STACK_SIZE>
+bool MazeSolver<TMotor, TSensor,  TLogger, STACK_SIZE>::solve(){
+  junction_t junc;
+  uint8_t    choose;
+  while ((junc = cruise()) == NORM);
+
+  m_logger.log(juncToName(junc))->log(" found\n");
+
+  uint8_t curDirect;
+  curDirect = _FORE;
+
+  if (_juncHas(junc, _LEFT)){
+    redirect(curDirect, _LEFT);
+    stackPush(junc, _LEFT);
+    if (solve()) return true;
+    stackPop(&junc, &choose);
+          m_matcher->update();
+    while(!(MATCH(m_matcher, AAAAB) || MATCH(m_matcher, BAAAA))){
+      m_matcher->update();
+      fix();
+    }
+    SETMOTOR(m_motor, CRUISE_SPEED, CRUISE_SPEED);
+    delay(DASH_TIME);
+    SETMOTOR(m_motor, 0, 0);
+
+    curDirect = _RIGHT;
+  }
+  if (_juncHas(junc, _FORE)){
+    redirect(curDirect, _FORE);
+    stackPush(junc, _FORE);
+    if (solve()) return true;
+    stackPop(&junc, &choose);
+          m_matcher->update();
+    while(!(MATCH(m_matcher, AAAAB) || MATCH(m_matcher, BAAAA))){
+      m_matcher->update();
+      fix();  
+    }
+    SETMOTOR(m_motor, CRUISE_SPEED, CRUISE_SPEED);
+    delay(DASH_TIME);
+    SETMOTOR(m_motor, 0, 0);
+    
+    curDirect = _BACK;
+  }
+  if (_juncHas(junc, _RIGHT)){
+    redirect(curDirect, _RIGHT);
+    stackPush(junc, _RIGHT);
+    if (solve()) return true;
+    stackPop(&junc, &choose);
+          m_matcher->update();
+    while(!(MATCH(m_matcher, AAAAB) || MATCH(m_matcher, BAAAA))){
+      m_matcher->update();
+      fix();  
+    }
+
+    SETMOTOR(m_motor, CRUISE_SPEED, CRUISE_SPEED);
+    delay(DASH_TIME);
+    SETMOTOR(m_motor, 0, 0);
+
+    curDirect = _LEFT;
+  }
+  if (_juncHas(junc, _BACK)){
+    redirectWithLine(curDirect, _BACK);
+    return false;  
+  }
+  return true;
+}
+
+template <typename TMotor, typename TSensor, typename TLogger, uint8_t STACK_SIZE>
+void MazeSolver<TMotor, TSensor,  TLogger, STACK_SIZE>::replay(){
+  m_logger.log(m_sp);
+  for (uint8_t i = 0; i < m_sp; ++ i){
+//    if(_juncHas(m_stackJunc[i], _LEFT)){
+//      while(!(MATCH(m_matcher, AAAAB) || MATCH(m_matcher, BAAAA))){
+//        m_matcher->update();
+//        fix();  
+//      }
+//    }
+//    else if(_juncHas(m_stackJunc[i], _RIGHT)){
+//      while(!(MATCH(m_matcher, AAAAB) || MATCH(m_matcher, BAAAA))){
+//        m_matcher->update();
+//        fix();  
+//      }
+//    }
+//    else {
+//      while(!(MATCH(m_matcher, AAAAB) || MATCH(m_matcher, BAAAA))){
+//        m_matcher->update();
+//        fix();  
+//      }
+//    }
+
+    m_logger.log("IN REPLAY\n");
+    m_matcher->update();
+    while(!(MATCH(m_matcher, AAAAB) || MATCH(m_matcher, BAAAA))){
+      fix();  
+    }
+
+    dash(DASH_TIME);
+
+    switch (m_stackChoose[i]){
+      case _LEFT:
+        turnLeft();
+        break;
+      case _FORE:
+        break;
+      case _BACK:
+        //turnAround();
+        // impossible!
+        break;
+      case _RIGHT:
+        turnRight();
+        break;
+      default:
+        break;
+    }
+  }  
+  m_matcher->update();
+  while(!(MATCH(m_matcher, AAAAB) || MATCH(m_matcher, BAAAA))){
+    fix();  
+  }
+  SETMOTOR(m_motor, 0, 0);
+  m_logger.logger("SUCC");
+}
+
+
+template <typename TMotor, typename TSensor, typename TLogger, uint8_t STACK_SIZE>
+void MazeSolver<TMotor, TSensor,  TLogger, STACK_SIZE>::turnLeft(){
+  SETMOTOR(m_motor, 0, 0);
+  delay(100);
+  SETMOTOR(m_motor, -TURN_SPEED, TURN_SPEED);
+  delay(TURN_TIME);
+  SETMOTOR(m_motor, 0, 0);
+}
+
+template <typename TMotor, typename TSensor, typename TLogger, uint8_t STACK_SIZE>
+void MazeSolver<TMotor, TSensor,  TLogger, STACK_SIZE>::turnRight(){
+  SETMOTOR(m_motor, 0, 0);
+  delay(100);
+  SETMOTOR(m_motor, TURN_SPEED, -TURN_SPEED);
+  delay(TURN_TIME);
+  SETMOTOR(m_motor, 0, 0);
+}
+
+template <typename TMotor, typename TSensor, typename TLogger, uint8_t STACK_SIZE>
+void MazeSolver<TMotor, TSensor,  TLogger, STACK_SIZE>::turnAround(){
+  SETMOTOR(m_motor, 0, 0);
+  delay(100);
+  SETMOTOR(m_motor, TURN_SPEED, -TURN_SPEED);
+  delay(2 * TURN_TIME);
+  SETMOTOR(m_motor, 0, 0);
+}
+
+template <typename TMotor, typename TSensor, typename TLogger, uint8_t STACK_SIZE>
+void MazeSolver<TMotor, TSensor,  TLogger, STACK_SIZE>::turnLeftWithLine(){
+  SETMOTOR(m_motor, 0, 0);
+  delay(100);
+  SETMOTOR(m_motor, -TURN_SPEED, TURN_SPEED);
+  delay(0.8 * TURN_TIME);
+  do{
+    m_matcher->update();  
+  }while(!MATCH(m_matcher, AABAA));
+  SETMOTOR(m_motor, 0, 0);
+}
+
+template <typename TMotor, typename TSensor, typename TLogger, uint8_t STACK_SIZE>
+void MazeSolver<TMotor, TSensor,  TLogger, STACK_SIZE>::turnRightWithLine(){
+  SETMOTOR(m_motor, 0, 0);
+  delay(100);
+  SETMOTOR(m_motor, TURN_SPEED, -TURN_SPEED);
+  delay(0.8 * TURN_TIME);
+  do{
+    m_matcher->update();  
+  }while(!MATCH(m_matcher, AABAA));
+  SETMOTOR(m_motor, 0, 0);
+}
+
+template <typename TMotor, typename TSensor, typename TLogger, uint8_t STACK_SIZE>
+void MazeSolver<TMotor, TSensor,  TLogger, STACK_SIZE>::turnAroundWithLine(){
+  SETMOTOR(m_motor, 0, 0);
+  delay(100);
+  SETMOTOR(m_motor, TURN_SPEED, -TURN_SPEED);
+  delay(1.4 * TURN_TIME);
+  do{
+    m_matcher->update();  
+  }while(!MATCH(m_matcher, AABAA));
+  SETMOTOR(m_motor, 0, 0);
+}
+
+
+template <typename TMotor, typename TSensor, typename TLogger, uint8_t STACK_SIZE>
+SensorMatch<TSensor, 5>* MazeSolver<TMotor, TSensor,  TLogger, STACK_SIZE>::getMatcher(){
+  return m_matcher;
+  
+}
+
+template <typename TMotor, typename TSensor, typename TLogger, uint8_t STACK_SIZE>
+junction_t MazeSolver<TMotor, TSensor,  TLogger, STACK_SIZE>::cruise(){
+
+  m_matcher->update();
+  if(MATCH(m_matcher, AWWWA)){
+    if( m_blankTime ){
+      if (millis() - m_blankTime > BLANK_TIME){
+        m_blankTime = 0;
+        return ROADEND;   
+      }
+    }
+    else{
+      m_blankTime = millis();  
+    }
+
+    SETMOTOR(m_motor, CRUISE_SPEED, -CRUISE_SPEED);
+  }
+  else{
+    m_blankTime = 0;
+
+    if(m_matcher->isBlack(0) || m_matcher->isBlack(4)){
+      if( ! m_debonus ){
+        m_debonus = millis();  
+      }
+      else if(millis() - m_debonus > DEBONUS_TIME){
+        m_debonus = 0;
+        uint8_t lineFound = 0;
+        lineFound |= m_matcher->isBlack(0) << 0;
+        lineFound |= m_matcher->isBlack(4) << 4;
+        auto curTime = millis();
+        SETMOTOR(m_motor, CRUISE_SPEED, CRUISE_SPEED);
+        while (millis() - curTime < DASH_TIME){
+          m_matcher->update();
+          lineFound |= m_matcher->isBlack(0) << 0;
+          lineFound |= m_matcher->isBlack(4) << 4;
+        }
+        SETMOTOR(m_motor, 0, 0);
+        delay(200); // for statbility
+        m_matcher->update();
+
+        curTime = millis();
+        SETMOTOR(m_motor, 100, -100);
+        while (millis() - curTime < 40){
+          lineFound |= m_matcher->isBlack(1) << 1;
+          lineFound |= m_matcher->isBlack(2) << 2;
+          lineFound |= m_matcher->isBlack(3) << 3;
+        }
+        SETMOTOR(m_motor, -100, 100);
+        while (millis() - curTime < 40){
+          lineFound |= m_matcher->isBlack(1) << 1;
+          lineFound |= m_matcher->isBlack(2) << 2;
+          lineFound |= m_matcher->isBlack(3) << 3;
+        }
+        SETMOTOR(m_motor, 0, 0);
+  
+#define DETECT(line, mask) (((line) & (mask)) == (mask))
+        if (DETECT(lineFound, 0b01110)) return EXIT;
+        if (DETECT(lineFound, 0b10001) && (lineFound & 0b01110)) return CROSS;
+        if (DETECT(lineFound, 0b10000) && (lineFound & 0b01110)) return RJUNC;
+        if (DETECT(lineFound, 0b00001) && (lineFound & 0b01110)) return LJUNC;
+        if (DETECT(lineFound, 0b10001)) return TJUNC;
+        if (DETECT(lineFound, 0b10000)) return RCORN;
+        if (DETECT(lineFound, 0b00001)) return LCORN;
+#undef DETECT
+      }
+    }
+    else if(MATCH(m_matcher, ABAAA)){
+      SETMOTOR(m_motor, -CRUISE_SPEED, CRUISE_SPEED);
+    }
+    else if(MATCH(m_matcher, AAABA)){
+      SETMOTOR(m_motor, CRUISE_SPEED, -CRUISE_SPEED);
+    }
+    else{
+      SETMOTOR(m_motor, CRUISE_SPEED, CRUISE_SPEED);
+    }
+  }
+  return NORM;
+};
+
+#undef DASH_TIME
+#undef BLANK_TIME
+#undef CRUISE_SPEED
+#undef DEBONUS_TIME
+#undef TURN_SPEED
+#undef TURN_TIME
+
+#undef _LEFT
+#undef _FORE
+#undef _BACK
+#undef _RIGHT
+#undef _juncHas
+
+#undef JUNC_DEFS
+#undef MATCH
+#undef ELS_MATCH
+
+/******************* Motor9110.h **********************/
+#pragma once
+
+#include <Arduino.h>
+#include <FastGPIO.h>
+
+template <int clk1, int cnt1, int clk2, int cnt2>
+class Motor9110 {
+public:
+  Motor9110 (){}
+
+  inline void begin () __attribute__((always_inline)){
+    FastGPIO::Pin<clk1>::setOutputHigh();  
+    FastGPIO::Pin<cnt1>::setOutputHigh();  
+    FastGPIO::Pin<clk2>::setOutputHigh();  
+    FastGPIO::Pin<cnt2>::setOutputHigh();  
+    FastGPIO::Pin<clk1>::setPWM(255);
+    FastGPIO::Pin<cnt1>::setPWM(255);
+    FastGPIO::Pin<clk2>::setPWM(255);
+    FastGPIO::Pin<cnt2>::setPWM(255);
+//    pinMode(clk1, OUTPUT);
+//    pinMode(cnt1, OUTPUT);
+//    pinMode(clk2, OUTPUT);
+//    pinMode(cnt2, OUTPUT);
+//    analogWrite(clk1, 255);
+//    analogWrite(cnt1, 255);
+//    analogWrite(clk2, 255);
+//    analogWrite(cnt2, 255);
+  }
+
+  void inline setMotorLeft(bool backward, unsigned char speed)__attribute__((always_inline)){
+    if (speed == 0){
+      FastGPIO::Pin<cnt1>::setPWMValue(255);
+      FastGPIO::Pin<clk1>::setPWMValue(255);
+//      analogWrite(cnt1, 255);
+//      analogWrite(cnt1, 255);
+    }
+    else if (backward) {
+      FastGPIO::Pin<cnt1>::setPWMValue(255);
+      FastGPIO::Pin<clk1>::setPWMValue(255 - speed);
+//      analogWrite(cnt1, 255);
+//      analogWrite(clk1, speed);
+    }
+    else {
+      FastGPIO::Pin<clk1>::setPWMValue(255);
+      FastGPIO::Pin<cnt1>::setPWMValue(255 - speed);
+//      analogWrite(clk1, 255);
+//      analogWrite(cnt1, speed);  
+    }  
+  }
+
+  void inline setMotorRight(bool backward, unsigned char speed)__attribute__((always_inline)){
+    if (speed == 0){
+      FastGPIO::Pin<cnt2>::setPWMValue(255);
+      FastGPIO::Pin<clk2>::setPWMValue(255);
+//      analogWrite(cnt2, 255);
+//      analogWrite(cnt2, 255);
+    }
+    else if (backward) {
+      FastGPIO::Pin<cnt2>::setPWMValue(255);
+      FastGPIO::Pin<clk2>::setPWMValue(255 - speed);
+//      analogWrite(cnt2, 255);
+//      analogWrite(clk2, speed);
+    }
+    else {
+      FastGPIO::Pin<clk2>::setPWMValue(255);
+      FastGPIO::Pin<cnt2>::setPWMValue(255 - speed);
+//      analogWrite(clk2, 255);
+//      analogWrite(cnt2, speed);  
+    }  
+  }
+
+  inline void setMotor (unsigned char motorId, bool backward, unsigned char speed){
+    if (motorId == 1){
+      setMotorLeft(backward, speed);
+    }
+    else if (motorId == 2){
+      setMotorRight(backward, speed);
+    }
+  }
+  inline void setMotor(int speedL, int speedR){
+    if(speedL > 0){
+      setMotorLeft(false, speedL);  
+    }
+    else{
+      setMotorLeft(true, -speedL);  
+    }
+
+    if(speedR > 0){
+      setMotorRight(false, speedR);
+    }
+    else{
+      setMotorRight(true, -speedR);
+    }
+  }
+};
+
+#define SETMOTOR(motor, speedL, speedR) do{\
+  if((speedL) > 0){\
+    (motor).setMotorLeft(false, (speedL));\
+  }\
+  else{\
+    (motor).setMotorLeft(true, -(speedL));\
+  }\
+  if(speedR > 0){\
+    (motor).setMotorRight(false, (speedR));\
+  }\
+  else{\
+    (motor).setMotorRight(true, -(speedR));\
+  }\
+}while(0);
+
+/******************* SensorDigital.h **********************/
+#pragma once
+
+#include <FastGPIO.h>
+#include <Arduino.h>
+
+template <uint8_t ...pins>
+struct Pins_5{
+  static_assert(sizeof...(pins) == 5, "5 pins required");
+  static uint8_t constexpr constValue[5] = {pins...};
+  static uint8_t const value[5]; 
+};
+
+template <uint8_t ...pins>
+uint8_t const Pins_5<pins...>::value[] = {pins...};
+
+template <typename Pins>
+class SensorDigital {
+  public:
+    inline void begin() {
+      FastGPIO::Pin<Pins::constValue[0]>::setInputPulledUp();
+      FastGPIO::Pin<Pins::constValue[1]>::setInputPulledUp();
+      FastGPIO::Pin<Pins::constValue[2]>::setInputPulledUp();
+      FastGPIO::Pin<Pins::constValue[3]>::setInputPulledUp();
+      FastGPIO::Pin<Pins::constValue[4]>::setInputPulledUp();
+    }
+    inline bool readSensor(char n) __attribute__((always_inline)){
+      switch (n){
+        case 0:  return FastGPIO::Pin<Pins::constValue[0]>::isInputHigh();
+        case 1:  return FastGPIO::Pin<Pins::constValue[1]>::isInputHigh();
+        case 2:  return FastGPIO::Pin<Pins::constValue[2]>::isInputHigh();
+        case 3:  return FastGPIO::Pin<Pins::constValue[3]>::isInputHigh();
+        case 4:  return FastGPIO::Pin<Pins::constValue[4]>::isInputHigh();
+        default: return false;   
+      }
+    }
+};
+
+/******************* SensorMatch.h **********************/
+#pragma once
+
+#include "SensorDigital.h"
+
+template <typename T, unsigned char SENSOR_NUMBER>
+class SensorMatch { 
+  private:
+    T &m_sensor;
+    bool m_lastRead[SENSOR_NUMBER];   
+  public:
+    constexpr static char PATTERN_BLACK = 'B';
+    constexpr static char PATTERN_WHITE = 'W';
+    constexpr static char PATTERN_ANY   = '?';
+    SensorMatch(T &sensor): m_sensor(sensor){}
+
+    inline void update() {
+      for (char i = 0; i < SENSOR_NUMBER; i ++){
+        m_lastRead[i] = m_sensor.readSensor(i);
+      }
+    }
+    inline bool isBlack(uint8_t n){
+      return m_lastRead[n];  
+    }
+};
+
+#define M_B(sensor, n) ((sensor)->isBlack(n))
+#define M_W(sensor, n) (!(sensor)->isBlack(n))
+#define M_A(sensor, n) (1)
+
+#define MATCH_WWWWW(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BWWWW(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_AWWWW(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WBWWW(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BBWWW(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_ABWWW(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WAWWW(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BAWWW(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_AAWWW(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WWBWW(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BWBWW(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_AWBWW(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WBBWW(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BBBWW(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_ABBWW(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WABWW(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BABWW(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_AABWW(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WWAWW(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BWAWW(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_AWAWW(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WBAWW(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BBAWW(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_ABAWW(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WAAWW(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BAAWW(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_AAAWW(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WWWBW(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BWWBW(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_AWWBW(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WBWBW(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BBWBW(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_ABWBW(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WAWBW(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BAWBW(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_AAWBW(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WWBBW(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BWBBW(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_AWBBW(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WBBBW(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BBBBW(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_ABBBW(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WABBW(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BABBW(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_AABBW(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WWABW(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BWABW(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_AWABW(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WBABW(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BBABW(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_ABABW(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WAABW(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BAABW(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_AAABW(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WWWAW(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BWWAW(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_AWWAW(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WBWAW(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BBWAW(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_ABWAW(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WAWAW(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BAWAW(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_AAWAW(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WWBAW(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BWBAW(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_AWBAW(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WBBAW(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BBBAW(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_ABBAW(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WABAW(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BABAW(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_AABAW(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WWAAW(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BWAAW(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_AWAAW(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WBAAW(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BBAAW(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_ABAAW(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WAAAW(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_BAAAW(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_AAAAW(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_W(sensor, 4))
+#define MATCH_WWWWB(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BWWWB(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_AWWWB(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WBWWB(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BBWWB(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_ABWWB(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WAWWB(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BAWWB(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_AAWWB(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WWBWB(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BWBWB(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_AWBWB(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WBBWB(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BBBWB(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_ABBWB(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WABWB(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BABWB(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_AABWB(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WWAWB(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BWAWB(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_AWAWB(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WBAWB(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BBAWB(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_ABAWB(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WAAWB(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BAAWB(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_AAAWB(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WWWBB(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BWWBB(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_AWWBB(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WBWBB(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BBWBB(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_ABWBB(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WAWBB(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BAWBB(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_AAWBB(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WWBBB(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BWBBB(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_AWBBB(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WBBBB(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BBBBB(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_ABBBB(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WABBB(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BABBB(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_AABBB(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WWABB(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BWABB(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_AWABB(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WBABB(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BBABB(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_ABABB(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WAABB(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BAABB(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_AAABB(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WWWAB(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BWWAB(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_AWWAB(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WBWAB(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BBWAB(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_ABWAB(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WAWAB(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BAWAB(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_AAWAB(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WWBAB(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BWBAB(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_AWBAB(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WBBAB(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BBBAB(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_ABBAB(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WABAB(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BABAB(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_AABAB(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WWAAB(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BWAAB(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_AWAAB(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WBAAB(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BBAAB(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_ABAAB(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WAAAB(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_BAAAB(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_AAAAB(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_B(sensor, 4))
+#define MATCH_WWWWA(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BWWWA(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_AWWWA(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_WBWWA(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BBWWA(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_ABWWA(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_WAWWA(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BAWWA(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_AAWWA(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_WWBWA(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BWBWA(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_AWBWA(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_WBBWA(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BBBWA(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_ABBWA(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_WABWA(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BABWA(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_AABWA(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_WWAWA(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BWAWA(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_AWAWA(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_WBAWA(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BBAWA(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_ABAWA(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_WAAWA(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BAAWA(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_AAAWA(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_W(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_WWWBA(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BWWBA(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_AWWBA(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_WBWBA(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BBWBA(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_ABWBA(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_WAWBA(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BAWBA(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_AAWBA(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_WWBBA(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BWBBA(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_AWBBA(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_WBBBA(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BBBBA(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_ABBBA(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_WABBA(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BABBA(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_AABBA(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_WWABA(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BWABA(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_AWABA(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_WBABA(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BBABA(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_ABABA(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_WAABA(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BAABA(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_AAABA(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_B(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_WWWAA(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BWWAA(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_AWWAA(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_WBWAA(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BBWAA(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_ABWAA(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_WAWAA(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BAWAA(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_AAWAA(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_W(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_WWBAA(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BWBAA(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_AWBAA(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_WBBAA(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BBBAA(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_ABBAA(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_WABAA(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BABAA(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_AABAA(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_B(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_WWAAA(sensor) (M_W(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BWAAA(sensor) (M_B(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_AWAAA(sensor) (M_A(sensor, 0)&&M_W(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_WBAAA(sensor) (M_W(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BBAAA(sensor) (M_B(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_ABAAA(sensor) (M_A(sensor, 0)&&M_B(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_WAAAA(sensor) (M_W(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_BAAAA(sensor) (M_B(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+#define MATCH_AAAAA(sensor) (M_A(sensor, 0)&&M_A(sensor, 1)&&M_A(sensor, 2)&&M_A(sensor, 3)&&M_A(sensor, 4))
+
+#define MATCH(sensor, pattern) (MATCH_ ## pattern (sensor))
+
+/******************* FastGPIO.h **********************/
+// Copyright Pololu Corporation.  For more information, see http://www.pololu.com/
+
+/*! \file FastGPIO.h
+
+FastGPIO is a C++ header library for efficient AVR I/O.
+
+For an overview of the features of this library, see
+https://github.com/pololu/fastgpio-arduino.
+That is the main repository for this library, though copies may exist in other
+repositories.
+
+The FastGPIO::Pin class provides static functions for manipulating pins.  See
+its class reference for more information.
+
+\class FastGPIO::Pin
+
+@tparam pin The pin number
+
+The FastGPIO::Pin class provides static functions for manipulating pins.  This
+class can only be used if the pin number is known at compile time, which means
+it does not come from a variable that might change and it does not come from the
+result of a complicated calculation.
+
+Here is some example code showing how to use this class to blink an LED:
+
+~~~{.cpp}
+#include <FastGPIO.h>
+
+#define LED_PIN 13
+
+void setup() {
+}
+
+void loop() {
+  FastGPIO::Pin<LED_PIN>::setOutput(0);
+  delay(500);
+  FastGPIO::Pin<LED_PIN>::setOutput(1);
+  delay(500);
+}
+~~~
+
+*/
+
+#pragma once
+#include <avr/io.h>
+#include <stdint.h>
+
+/** @cond */
+#define _FG_SBI(mem_addr, bit) asm volatile("sbi %0, %1\n" : \
+    : "I" (mem_addr - __SFR_OFFSET), "I" (bit))
+#define _FG_CBI(mem_addr, bit) asm volatile("cbi %0, %1\n" : \
+    : "I" (mem_addr - __SFR_OFFSET), "I" (bit))
+#define _FG_PIN(port, bit) { _SFR_MEM_ADDR(PIN##port), _SFR_MEM_ADDR(PORT##port), \
+     _SFR_MEM_ADDR(DDR##port), bit }
+/** @endcond */
+
+namespace FastGPIO
+{
+    /** @cond */
+    /** The IOStruct struct and the pinStructs array below are not documented in
+     * the Doxygen documentation, but can be used by advanced users of this
+     * library and are considered to be part of the public API for the purposes
+     * of semantic versioning.
+     */
+    typedef struct IOStruct
+    {
+        uint8_t pinAddr;
+        uint8_t portAddr;
+        uint8_t ddrAddr;
+        uint8_t bit;
+
+        volatile uint8_t * pin() const
+        {
+            return (volatile uint8_t *)(uint16_t)pinAddr;
+        }
+
+        volatile uint8_t * port() const
+        {
+            return (volatile uint8_t *)(uint16_t)portAddr;
+        }
+
+        volatile uint8_t * ddr() const
+        {
+            return (volatile uint8_t *)(uint16_t)ddrAddr;
+        }
+    } IOStruct;
+    /** @endcond */
+
+#if defined(__AVR_ATmega328PB__) || defined(ARDUINO_AVR_A_STAR_328PB)
+
+    constexpr IOStruct pinStructs[] = {
+        _FG_PIN(D, 0),
+        _FG_PIN(D, 1),
+        _FG_PIN(D, 2),
+        _FG_PIN(D, 3),
+        _FG_PIN(D, 4),
+        _FG_PIN(D, 5),
+        _FG_PIN(D, 6),
+        _FG_PIN(D, 7),
+        _FG_PIN(B, 0),
+        _FG_PIN(B, 1),
+        _FG_PIN(B, 2),
+        _FG_PIN(B, 3),
+        _FG_PIN(B, 4),
+        _FG_PIN(B, 5),
+        _FG_PIN(C, 0),
+        _FG_PIN(C, 1),
+        _FG_PIN(C, 2),
+        _FG_PIN(C, 3),
+        _FG_PIN(C, 4),
+        _FG_PIN(C, 5),
+        _FG_PIN(E, 2),
+        _FG_PIN(E, 3),
+        _FG_PIN(E, 0),
+        _FG_PIN(E, 1),
+        _FG_PIN(C, 6), // RESET
+        _FG_PIN(C, 7), // Null pin (IO_NONE)
+    };
+
+#define IO_D0 0
+#define IO_D1 1
+#define IO_D2 2
+#define IO_D3 3
+#define IO_D4 4
+#define IO_D5 5
+#define IO_D6 6
+#define IO_D7 7
+#define IO_B0 8
+#define IO_B1 9
+#define IO_B2 10
+#define IO_B3 11
+#define IO_B4 12
+#define IO_B5 13
+#define IO_C0 14
+#define IO_C1 15
+#define IO_C2 16
+#define IO_C3 17
+#define IO_C4 18
+#define IO_C5 19
+#define IO_E2 20
+#define IO_E3 21
+#define IO_E0 22
+#define IO_E1 23
+#define IO_C6 24
+#define IO_NONE 25
+
+#elif defined(__AVR_ATmega168__) || defined(__AVR_ATmega168P__) || defined(__AVR_ATmega328__) || defined(__AVR_ATmega328P__)
+
+    constexpr IOStruct pinStructs[] = {
+        _FG_PIN(D, 0),
+        _FG_PIN(D, 1),
+        _FG_PIN(D, 2),
+        _FG_PIN(D, 3),
+        _FG_PIN(D, 4),
+        _FG_PIN(D, 5),
+        _FG_PIN(D, 6),
+        _FG_PIN(D, 7),
+        _FG_PIN(B, 0),
+        _FG_PIN(B, 1),
+        _FG_PIN(B, 2),
+        _FG_PIN(B, 3),
+        _FG_PIN(B, 4),
+        _FG_PIN(B, 5),
+        _FG_PIN(C, 0),
+        _FG_PIN(C, 1),
+        _FG_PIN(C, 2),
+        _FG_PIN(C, 3),
+        _FG_PIN(C, 4),
+        _FG_PIN(C, 5),
+        _FG_PIN(C, 6), // RESET
+        _FG_PIN(C, 7), // Null pin (IO_NONE)
+    };
+
+#define IO_D0 0
+#define IO_D1 1
+#define IO_D2 2
+#define IO_D3 3
+#define IO_D4 4
+#define IO_D5 5
+#define IO_D6 6
+#define IO_D7 7
+#define IO_B0 8
+#define IO_B1 9
+#define IO_B2 10
+#define IO_B3 11
+#define IO_B4 12
+#define IO_B5 13
+#define IO_C0 14
+#define IO_C1 15
+#define IO_C2 16
+#define IO_C3 17
+#define IO_C4 18
+#define IO_C5 19
+#define IO_C6 20
+#define IO_NONE 21
+
+#elif defined(__AVR_ATmega32U4__)
+
+    constexpr IOStruct pinStructs[] = {
+        _FG_PIN(D, 2),
+        _FG_PIN(D, 3),
+        _FG_PIN(D, 1),
+        _FG_PIN(D, 0),
+        _FG_PIN(D, 4),
+        _FG_PIN(C, 6),
+        _FG_PIN(D, 7),
+        _FG_PIN(E, 6),
+
+        _FG_PIN(B, 4),
+        _FG_PIN(B, 5),
+        _FG_PIN(B, 6),
+        _FG_PIN(B, 7),
+        _FG_PIN(D, 6),
+        _FG_PIN(C, 7),
+
+        _FG_PIN(B, 3),
+        _FG_PIN(B, 1),
+        _FG_PIN(B, 2),
+        _FG_PIN(B, 0),
+
+        _FG_PIN(F, 7),
+        _FG_PIN(F, 6),
+        _FG_PIN(F, 5),
+        _FG_PIN(F, 4),
+        _FG_PIN(F, 1),
+        _FG_PIN(F, 0),
+
+        _FG_PIN(D, 4),
+        _FG_PIN(D, 7),
+        _FG_PIN(B, 4),
+        _FG_PIN(B, 5),
+        _FG_PIN(B, 6),
+        _FG_PIN(D, 6),
+
+        // Extra pins added by this library and not supported by the
+        // Arduino GPIO functions:
+        _FG_PIN(D, 5),
+        _FG_PIN(E, 2),
+
+        _FG_PIN(E, 0)  // Null pin (IO_NONE)
+    };
+
+#define IO_D2 0
+#define IO_D3 1
+#define IO_D1 2
+#define IO_D0 3
+#define IO_D4 4
+#define IO_C6 5
+#define IO_D7 6
+#define IO_E6 7
+#define IO_B4 8
+#define IO_B5 9
+#define IO_B6 10
+#define IO_B7 11
+#define IO_D6 12
+#define IO_C7 13
+#define IO_B3 14
+#define IO_B1 15
+#define IO_B2 16
+#define IO_B0 17
+#define IO_F7 18
+#define IO_F6 19
+#define IO_F5 20
+#define IO_F4 21
+#define IO_F1 22
+#define IO_F0 23
+#define IO_D5 30
+#define IO_E2 31
+#define IO_NONE 32
+
+#else
+#error FastGPIO does not support this board.
+#endif
+
+
+#if defined(__AVR_ATmega168__) || defined(__AVR_ATmega168P__) || defined(__AVR_ATmega328__) || defined(__AVR_ATmega328P__)
+
+typedef struct {
+    uint8_t TCCRAddr;
+    uint8_t COM;
+    uint8_t OCRAddr;
+} PWMStruct;
+
+#define _FG_NO_TIMER { 0, 0, 0 }
+#define _FG_PWM(TIMERn, TIMERx) { _SFR_MEM_ADDR(TCCR ## TIMERn ## A),\
+    COM ## TIMERn ## TIMERx ## 1, _SFR_MEM_ADDR(OCR  ## TIMERn ## TIMERx) }
+
+
+constexpr PWMStruct PWMStructs[] = {
+    _FG_NO_TIMER,        // Pin 0
+    _FG_NO_TIMER,        // Pin 1
+    _FG_NO_TIMER,        // Pin 2
+    _FG_PWM(2, B),       // Pin 3
+    _FG_NO_TIMER,        // Pin 4
+    _FG_PWM(0, B),       // Pin 5
+    _FG_PWM(0, A),       // Pin 6
+    _FG_NO_TIMER,        // Pin 7
+    _FG_NO_TIMER,        // Pin 9
+    _FG_PWM(1, A),       // Pin 9
+    _FG_PWM(1, B),       // Pin 10
+    _FG_PWM(2, A),       // Pin 11
+};
+
+#undef _FG_PWM
+#undef _FG_NO_TIMER
+
+#endif
+
+
+    template<uint8_t pin> class Pin
+    {
+    public:
+        /*! \brief Configures the pin to be an output driving low.
+         *
+         * This is equivalent to calling setOutput with an argument of 0,
+         * but it has a simpler implementation which means it is more
+         * likely to be compiled down to just 2 assembly instructions.
+         */
+        static inline void setOutputLow() __attribute__((always_inline))
+        {
+            _FG_CBI(pinStructs[pin].portAddr, pinStructs[pin].bit);
+            _FG_SBI(pinStructs[pin].ddrAddr, pinStructs[pin].bit);
+        }
+
+        /*! \brief Configures the pin to be an output driving high.
+         *
+         * This is equivalent to calling setOutput with an argument of 1,
+         * but it has a simpler implementation which means it is more
+         * likely to be compiled down to just 2 assembly instructions.
+         */
+        static inline void setOutputHigh() __attribute__((always_inline))
+        {
+            _FG_SBI(pinStructs[pin].portAddr, pinStructs[pin].bit);
+            _FG_SBI(pinStructs[pin].ddrAddr, pinStructs[pin].bit);
+        }
+
+        /*! \brief Configures the pin to be an output and toggles it.
+         */
+        static inline void setOutputToggle() __attribute__((always_inline))
+        {
+            setOutputValueToggle();
+            _FG_SBI(pinStructs[pin].ddrAddr, pinStructs[pin].bit);
+        }
+
+        /*! \brief Sets the pin as an output.
+         *
+         * @param value Should be 0, LOW, or false to drive the pin low.  Should
+         * be 1, HIGH, or true to drive the pin high.
+         *
+         * The PORT bit is set before the DDR bit to ensure that the output is
+         * not accidentally driven to the wrong value during the transition.
+         */
+        static inline void setOutput(bool value) __attribute__((always_inline))
+        {
+            setOutputValue(value);
+            _FG_SBI(pinStructs[pin].ddrAddr, pinStructs[pin].bit);
+        }
+
+        /*! \brief Sets the output value of the pin to 0.
+         *
+         * This is mainly intended to be used on pins that have already been
+         * configured as an output in order to make the output drive low.
+         *
+         * If this is used on an input pin, it has the effect of disabling the
+         * input pin's pull-up resistor.
+         */
+        static inline void setOutputValueLow() __attribute__((always_inline))
+        {
+            _FG_CBI(pinStructs[pin].portAddr, pinStructs[pin].bit);
+        }
+
+        /*! \brief Sets the output value of the pin to 1.
+         *
+         * This is mainly intended to be used on pins that have already been
+         * configured as an output in order to make the output drive low.
+         *
+         * If this is used on an input pin, it has the effect of enabling the
+         * input pin's pull-up resistor.
+         */
+        static inline void setOutputValueHigh() __attribute__((always_inline))
+        {
+            _FG_SBI(pinStructs[pin].portAddr, pinStructs[pin].bit);
+        }
+
+        /*! \brief Toggles the output value of the pin.
+         *
+         * This is mainly intended to be used on pins that have already been
+         * configured as an output.  If the pin was driving low, this function
+         * changes it to drive high.  If the pin was driving high, this function
+         * changes it to drive low.
+         *
+         * If this function is used on an input pin, it has the effect of
+         * toggling the state of the input pin's pull-up resistor.
+         */
+        static inline void setOutputValueToggle() __attribute__((always_inline))
+        {
+            _FG_SBI(pinStructs[pin].pinAddr, pinStructs[pin].bit);
+        }
+
+        /*! \brief Sets the output value of the pin.
+         *
+         * @param value Should be 0, LOW, or false to drive the pin low.  Should
+         * be 1, HIGH, or true to drive the pin high.
+         *
+         * This is mainly intended to be used on pins that have already been
+         * configured as an output.
+         *
+         * If this function is used on an input pin, it has the effect of
+         * toggling setting the state of the input pin's pull-up resistor.
+         */
+        static inline void setOutputValue(bool value) __attribute__((always_inline))
+        {
+            if (value)
+            {
+                _FG_SBI(pinStructs[pin].portAddr, pinStructs[pin].bit);
+            }
+            else
+            {
+                _FG_CBI(pinStructs[pin].portAddr, pinStructs[pin].bit);
+            }
+        }
+
+        /*! \brief Sets a pin to be a digital input with the internal pull-up
+         *  resistor disabled.
+         */
+        static inline void setInput() __attribute__((always_inline))
+        {
+            _FG_CBI(pinStructs[pin].ddrAddr, pinStructs[pin].bit);
+            _FG_CBI(pinStructs[pin].portAddr, pinStructs[pin].bit);
+        }
+
+        /*! \brief Sets a pin to be a digital input with the internal pull-up
+         *  resistor enabled.
+         */
+        static inline void setInputPulledUp() __attribute__((always_inline))
+        {
+            _FG_CBI(pinStructs[pin].ddrAddr, pinStructs[pin].bit);
+            _FG_SBI(pinStructs[pin].portAddr, pinStructs[pin].bit);
+        }
+
+        /*! \brief Reads the input value of the pin.
+         *
+         * @return 0 if the pin is low, 1 if the pin is high.
+         */
+        static inline bool isInputHigh() __attribute__((always_inline))
+        {
+            return *pinStructs[pin].pin() >> pinStructs[pin].bit & 1;
+
+            /* This is another option but it is less efficient in code
+               like "if (isInputHigh()) { ... }":
+            bool value;
+            asm volatile(
+                "ldi %0, 0\n"
+                "sbic %2, %1\n"
+                "ldi %0, 1\n"
+                : "=d" (value)
+                : "I" (pinStructs[pin].bit),
+                  "I" (pinStructs[pin].pinAddr - __SFR_OFFSET));
+            return value;
+            */
+        }
+
+        /*! \brief Returns 1 if the pin is configured as an output.
+         *
+         * @return 1 if the pin is an output, 0 if it is an input.
+         */
+        static inline bool isOutput() __attribute__((always_inline))
+        {
+            return *pinStructs[pin].ddr() >> pinStructs[pin].bit & 1;
+        }
+
+        /*! \brief Returns the output value of the pin.
+         *
+         * This is mainly intended to be called on pins that have been
+         * configured an an output.  If it is called on an input pin, the return
+         * value indicates whether the pull-up resistor is enabled or not.
+         */
+        static inline bool isOutputValueHigh() __attribute__((always_inline))
+        {
+            return *pinStructs[pin].port() >> pinStructs[pin].bit & 1;
+        }
+
+        /*! \brief Returns the full 2-bit state of the pin.
+         *
+         * Bit 0 of this function's return value is the pin's output value.
+         * Bit 1 of the return value is the pin direction; a value of 1
+         * means output.  All the other bits are zero.
+         */
+        static uint8_t getState()
+        {
+            uint8_t state;
+            asm volatile(
+                "ldi  %0, 0\n"
+                "sbic %2, %1\n"
+                "ori  %0, 1\n"   // Set state bit 0 to 1 if PORT bit is set.
+                "sbic %3, %1\n"
+                "ori  %0, 2\n"   // Set state bit 1 to 1 if DDR bit is set.
+                : "=a" (state)
+                : "I" (pinStructs[pin].bit),
+                  "I" (pinStructs[pin].portAddr - __SFR_OFFSET),
+                  "I" (pinStructs[pin].ddrAddr - __SFR_OFFSET));
+            return state;
+
+            /* Equivalent C++ code:
+              return isOutput() << 1 | isOutputValueHigh();
+            */
+        }
+
+        /*! \brief Sets the full 2-bit state of the pin.
+         *
+         * @param state The state of the pin, as returns from getState.
+         * All bits other than bits 0 and 1 are ignored.
+         *
+         * Sometimes this function will need to change both the PORT bit (which
+         * specifies the output value) and the DDR bit (which specifies whether
+         * the pin is an output).  If the DDR bit is getting set to 0, this
+         * function changes DDR first, and if it is getting set to 1, this
+         * function changes DDR last.  This guarantees that the intermediate pin
+         * state is always an input state.
+         */
+        static void setState(uint8_t state)
+        {
+            asm volatile(
+                "bst  %0, 1\n"   // Set DDR to 0 if needed
+                "brts .+2\n"
+                "cbi  %3, %1\n"
+                "bst  %0, 0\n"   // Copy state bit 0 to PORT bit
+                "brts .+2\n"
+                "cbi  %2, %1\n"
+                "brtc .+2\n"
+                "sbi  %2, %1\n"
+                "bst  %0, 1\n"   // Set DDR to 1 if needed
+                "brtc .+2\n"
+                "sbi  %3, %1\n"
+                :
+                : "a" (state),
+                  "I" (pinStructs[pin].bit),
+                  "I" (pinStructs[pin].portAddr - __SFR_OFFSET),
+                  "I" (pinStructs[pin].ddrAddr - __SFR_OFFSET));
+        }
+
+
+#if defined(__AVR_ATmega168__) || defined(__AVR_ATmega168P__) || defined(__AVR_ATmega328__) || defined(__AVR_ATmega328P__)
+        static inline setupPWM() __attribute__((always_inline)){
+            static_assert( pin < 12 && PWMStructs[pin].TCCRAddr, 
+                    "this pin is not support PWM");
+            _SFR_MEM8(PWMStructs[pin].TCCRAddr) 
+		|= _BV(PWMStructs[pin].COM);
+        }
+        static inline setPWM(uint8_t duty) __attribute__((always_inline)){
+            setupPWM();
+            _SFR_MEM8(PWMStructs[pin].OCRAddr) = duty;
+        }
+        static inline setPWMValue(uint8_t duty) __attribute__((always_inline)){
+            static_assert( pin < 12 && PWMStructs[pin].TCCRAddr, 
+                    "this pin is not support PWM");
+            _SFR_MEM8(PWMStructs[pin].OCRAddr) = duty;
+        }
+    };
+#endif
+
+    /*! This class saves the state of the specified pin in its constructor when
+     * it is created, and restores the pin to that state in its destructor.
+     * This can be very useful if a pin is being used for multiple purposes.
+     * It allows you to write code that temporarily changes the state of the
+     * pin and is guaranteed to restore the state later.
+     *
+     * For example, if you were controlling both a button and an LED using a
+     * single pin and you wanted to see if the button was pressed without
+     * affecting the LED, you could write:
+     *
+     * ~~~{.cpp}
+     * bool buttonIsPressed()
+     * {
+     *     FastGPIO::PinLoan<IO_D5> loan;
+     *     FastGPIO::Pin<IO_D5>::setInputPulledUp();
+     *     _delay_us(10);
+     *     return !FastGPIO::Pin<IO_D5>::isInputHigh();
+     * }
+     * ~~~
+     *
+     * This is equivalent to:
+     *
+     * ~~~{.cpp}
+     * bool buttonIsPressed()
+     * {
+     *     uint8_t state = FastGPIO::Pin<IO_D5>::getState();
+     *     FastGPIO::Pin<IO_D5>::setInputPulledUp();
+     *     _delay_us(10);
+     *     bool value = !FastGPIO::Pin<IO_D5>::isInputHigh();
+     *     FastGPIO::Pin<IO_D5>::setState(state);
+     *     return value;
+     * }
+     * ~~~
+     */
+    template<uint8_t pin> class PinLoan
+    {
+    public:
+        /*! \brief The state of the pin as returned from FastGPIO::Pin::getState. */
+        uint8_t state;
+
+        PinLoan()
+        {
+            state = Pin<pin>::getState();
+        }
+
+        ~PinLoan()
+        {
+            Pin<pin>::setState(state);
+        }
+    };
+};
+
+#undef _FG_PIN
+#undef _FG_CBI
+#undef _FG_SBI
+
